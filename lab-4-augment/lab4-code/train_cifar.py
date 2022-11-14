@@ -108,7 +108,7 @@ def main(args):
     criterion = nn.CrossEntropyLoss()
 
     ## TASK 11: Define the optimizer
-    optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate)
+    optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate, momentum=0.9)
 
     log_dir = get_summary_writer_log_dir(args)
     print(f"Writing logs to {log_dir}")
@@ -143,6 +143,7 @@ class CNN(nn.Module):
             padding=(2, 2),
         )
         self.initialise_layer(self.conv1)
+        self.bn1 = nn.BatchNorm2d(32)
         self.pool1 = nn.MaxPool2d(kernel_size=(2, 2), stride=(2, 2))
         self.conv2 = nn.Conv2d(
             in_channels=32,
@@ -151,19 +152,27 @@ class CNN(nn.Module):
             padding=(2, 2),
         )
         self.initialise_layer(self.conv2)
+        self.bn2 = nn.BatchNorm2d(64)
         self.pool2 = nn.MaxPool2d(kernel_size=(2, 2), stride=(2, 2))
         self.fc1 = nn.Linear(4096, 1024)
         self.initialise_layer(self.fc1)
+        self.bn3 = nn.BatchNorm1d(1024)
         self.fc2 = nn.Linear(1024, self.class_count)
         self.initialise_layer(self.fc2)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
-        x = F.relu(self.conv1(images))
+        x = self.conv1(images)
+        x = self.bn1(x)
+        x = F.relu(x)
         x = self.pool1(x)
-        x = F.relu(self.conv2(x))
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = F.relu(x)
         x = self.pool2(x)
         x = torch.flatten(x, start_dim=1)
         x = self.fc1(x)
+        x = self.bn3(x)
+        x = F.relu(x)
         x = self.fc2(x)
         return x
 
@@ -330,7 +339,7 @@ def get_summary_writer_log_dir(args: argparse.Namespace) -> str:
         from getting logged to the same TB log directory (which you can't easily
         untangle in TB).
     """
-    tb_log_dir_prefix = f'CNN_bs={args.batch_size}_lr={args.learning_rate}_run_'
+    tb_log_dir_prefix = f'CNN_bn_bs={args.batch_size}_lr={args.learning_rate}_momentum=0.9_run_'
     i = 0
     while i < 1000:
         tb_log_dir = args.log_dir / (tb_log_dir_prefix + str(i))
