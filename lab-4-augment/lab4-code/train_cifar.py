@@ -24,9 +24,17 @@ parser = argparse.ArgumentParser(
     formatter_class=argparse.ArgumentDefaultsHelpFormatter,
 )
 default_dataset_dir = Path.home() / ".cache" / "torch" / "datasets"
+parser.add_argument("--dropout", default=0, type=float)
+parser.add_argument("--data-aug-hflip", action="store_true")
+parser.add_argument("--data-aug-brightness", default=0, type=float)
+parser.add_argument("--data-aug-crop", default=None, type=int)
 parser.add_argument("--dataset-root", default=default_dataset_dir)
 parser.add_argument("--log-dir", default=Path("logs"), type=Path)
 parser.add_argument("--learning-rate", default=1e-2, type=float, help="Learning rate")
+
+parser.add_argument("--checkpoint-path", type=Path)
+parser.add_argument("--checkpoint-frequency", type=int, default=1, help="Save a checkpoint every N epochs")
+parser.add_argument("--resume-checkpoint", type=Path)
 parser.add_argument(
     "--batch-size",
     default=128,
@@ -79,13 +87,27 @@ else:
 
 
 def main(args):
-    transform = transforms.ToTensor()
+    train_transforms = []
+    if args.data_aug_hflip: 
+        train_transforms.append(transforms.RandomHorizontalFlip())
+    if args.data_aug_crop:
+        train_transforms.append(transforms.RandomCrop(args.data_aug_crop))
+    train_transforms.append(
+        transforms.transforms.ColorJitter(brightness=args.data_aug_brightness)
+    )
+    train_transforms.append(
+        transforms.ToTensor()
+    )
+
+    train_transform = transforms.Compose(train_transforms)
+    test_transform = transforms.ToTensor()
+
     args.dataset_root.mkdir(parents=True, exist_ok=True)
     train_dataset = torchvision.datasets.CIFAR10(
-        args.dataset_root, train=True, download=True, transform=transform
+        args.dataset_root, train=True, download=True, transform=train_transform
     )
     test_dataset = torchvision.datasets.CIFAR10(
-        args.dataset_root, train=False, download=False, transform=transform
+        args.dataset_root, train=False, download=False, transform=test_transform
     )
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
@@ -102,7 +124,7 @@ def main(args):
         pin_memory=True,
     )
 
-    model = CNN(height=32, width=32, channels=3, class_count=10)
+    model = CNN(height=32, width=32, channels=3, class_count=10, dropout=args.dropout)
 
     ## TASK 8: Redefine the criterion to be softmax cross entropy
     criterion = nn.CrossEntropyLoss()
@@ -116,6 +138,19 @@ def main(args):
             str(log_dir),
             flush_secs=5
     )
+
+    start_epoch = 0
+
+    print(args.checkpoint_path)
+
+    if args.resume_checkpoint is not None:
+        checkpoint = torch.load(args.resume_checkpoint)
+        print(f"Loading model from {args.resume_checkpoint}")
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch']
+        loss = checkpoint['loss']
+
     trainer = Trainer(
         model, train_loader, test_loader, criterion, optimizer, summary_writer, DEVICE
     )
@@ -125,16 +160,19 @@ def main(args):
         args.val_frequency,
         print_frequency=args.print_frequency,
         log_frequency=args.log_frequency,
+        start_epoch=start_epoch
     )
 
     summary_writer.close()
 
 
 class CNN(nn.Module):
-    def __init__(self, height: int, width: int, channels: int, class_count: int):
+    def __init__(self, height: int, width: int, channels: int, class_count: int, dropout: int):
         super().__init__()
         self.input_shape = ImageShape(height=height, width=width, channels=channels)
         self.class_count = class_count
+
+        self.dropout = nn.Dropout(p=dropout)
 
         self.conv1 = nn.Conv2d(
             in_channels=self.input_shape.channels,
@@ -170,10 +208,10 @@ class CNN(nn.Module):
         x = F.relu(x)
         x = self.pool2(x)
         x = torch.flatten(x, start_dim=1)
-        x = self.fc1(x)
+        x = self.fc1(self.dropout(x))
         x = self.bn3(x)
         x = F.relu(x)
-        x = self.fc2(x)
+        x = self.fc2(self.dropout(x))
         return x
 
     @staticmethod
@@ -210,7 +248,8 @@ class Trainer:
         val_frequency: int,
         print_frequency: int = 20,
         log_frequency: int = 5,
-        start_epoch: int = 0
+        start_epoch: int = 0,
+        checkpoint_frequency: int = 1
     ):
         self.model.train()
         for epoch in range(start_epoch, epochs):
@@ -231,6 +270,8 @@ class Trainer:
                 with torch.no_grad():
                     preds = logits.argmax(-1)
                     accuracy = compute_accuracy(labels, preds)
+                    class_accuracy = compute_all_class_accuracy(labels, preds, self.model.class_count)
+                    print(class_accuracy)
 
                 data_load_time = data_load_end_time - data_load_start_time
                 step_time = time.time() - data_load_end_time
@@ -243,6 +284,16 @@ class Trainer:
                 data_load_start_time = time.time()
 
             self.summary_writer.add_scalar("epoch", epoch, self.step)
+            
+            if (epoch + 1) % args.checkpoint_frequency or (epoch + 1) == epoch:
+                print(f"Saving model to {args.checkpoint_path}")
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': self.model.state_dict(),
+                    'optimizer_state_dict': self.optimizer.state_dict(),
+                    'loss': loss,
+                }, args.checkpoint_path)
+
             if ((epoch + 1) % val_frequency) == 0:
                 self.validate()
                 # self.validate() will put the model in validation mode,
@@ -327,6 +378,33 @@ def compute_accuracy(
     return float((labels == preds).sum()) / len(labels)
 
 
+def compute_class_accuracy(labels: Union[torch.Tensor, np.ndarray], preds: Union[torch.Tensor, np.ndarray], class_index: int
+) -> float:
+    """
+    Args:
+        labels: ``(batch_size, class_count)`` tensor or array containing example labels
+        preds: ``(batch_size, class_count)`` tensor or array containing model prediction
+        class_index ``class_index`` index of class for accuracy in range 0-9
+    """
+    assert len(labels) == len(preds)
+    idx = labels == class_index
+    return float((labels[idx] == preds[idx]).sum() / len(labels[idx]))
+
+def compute_all_class_accuracy(labels: Union[torch.Tensor, np.ndarray], preds: Union[torch.Tensor, np.ndarray], class_count: int
+) -> np.ndarray:
+    """
+    Args:
+        labels: ``(batch_size, class_count)`` tensor or array containing example labels
+        preds: ``(batch_size, class_count)`` tensor or array containing model prediction
+        class_count: ``class_count`` total number of classes
+    """
+    assert len(labels) == len(preds)
+    accuracies = np.zeros((class_count))
+    for c in range(0, class_count):
+        accuracies[c] = compute_class_accuracy(labels, preds, c)
+    return accuracies
+
+
 def get_summary_writer_log_dir(args: argparse.Namespace) -> str:
     """Get a unique directory that hasn't been logged to before for use with a TB
     SummaryWriter.
@@ -339,7 +417,17 @@ def get_summary_writer_log_dir(args: argparse.Namespace) -> str:
         from getting logged to the same TB log directory (which you can't easily
         untangle in TB).
     """
-    tb_log_dir_prefix = f'CNN_bn_bs={args.batch_size}_lr={args.learning_rate}_momentum=0.9_run_'
+    tb_log_dir_prefix = (
+        f"CNN_bn_"
+        f"dropout={args.dropout}_"
+        f"bs={args.batch_size}_"
+        f"lr={args.learning_rate}_"
+        f"momentum=0.9_" +
+        f"brightness={args.data_aug_brightness}_" +
+        ("hflip_" if args.data_aug_hflip else "") +
+        (f"crop_{args.data_aug_crop}" if args.data_aug_crop else "") +
+        f"run_"
+    )
     i = 0
     while i < 1000:
         tb_log_dir = args.log_dir / (tb_log_dir_prefix + str(i))
